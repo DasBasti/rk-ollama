@@ -99,6 +99,22 @@ struct TagsResponse {
     models: Vec<ModelInfo>,
 }
 
+#[derive(Serialize)]
+struct RunningModelsResponse {
+    models: Vec<RunningModelInfo>,
+}
+
+#[derive(Serialize)]
+struct RunningModelInfo {
+    name: String,
+    model: String,
+    size: u64,
+    digest: String,
+    details: ModelDetails,
+    expires_at: String,
+    size_vram: u64,
+}
+
 #[derive(Deserialize, Debug)]
 struct ShowRequest {
     name: String,
@@ -543,18 +559,18 @@ async fn tags_handler() -> Json<TagsResponse> {
     // In a real implementation, you might scan a models directory or maintain a registry
     let response = TagsResponse {
         models: vec![ModelInfo {
-            name: "gemma3:1b".to_string(),
-            model: "gemma3:1b".to_string(),
+            name: "gemma2:2b".to_string(),
+            model: "gemma2:2b".to_string(),
             modified_at: chrono::Utc::now().to_rfc3339(),
             size: 1_073_741_824, // 1GB in bytes
-            digest: "sha256:1234567890abcdef".to_string(),
+            digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
             details: ModelDetails {
                 parent_model: "".to_string(),
-                format: "rkllm".to_string(),
+                format: "gguf".to_string(),
                 family: "gemma".to_string(),
                 families: Some(vec!["gemma".to_string()]),
-                parameter_size: "1B".to_string(),
-                quantization_level: "W8A8".to_string(),
+                parameter_size: "2B".to_string(),
+                quantization_level: "Q4_K_M".to_string(),
             },
         }],
     };
@@ -569,35 +585,35 @@ async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>
     
     // For now, return information about our single model
     // In a real implementation, you'd look up the specific model
-    if req.name == "gemma3:1b" || req.name.starts_with("gemma") {
+    if req.name == "gemma2:2b" || req.name.starts_with("gemma") {
         info!("Model '{}' found, returning detailed information", req.name);
         debug!("Generating modelfile and template information for: {}", req.name);
         
         let response = ShowResponse {
-            modelfile: "FROM gemma3:1b\nPARAMETER temperature 0.8\nPARAMETER top_p 0.9".to_string(),
+            modelfile: "FROM gemma2:2b\nPARAMETER temperature 0.8\nPARAMETER top_p 0.9".to_string(),
             parameters: "temperature 0.8\ntop_p 0.9\ntop_k 40\nrepeat_penalty 1.1".to_string(),
             template: "{{ if .System }}System: {{ .System }}\n\n{{ end }}{{ if .Prompt }}User: {{ .Prompt }}\n\nAssistant: {{ end }}".to_string(),
             details: ModelDetails {
                 parent_model: "".to_string(),
-                format: "rkllm".to_string(),
+                format: "gguf".to_string(),
                 family: "gemma".to_string(),
                 families: Some(vec!["gemma".to_string()]),
-                parameter_size: "1B".to_string(),
-                quantization_level: "W8A8".to_string(),
+                parameter_size: "2B".to_string(),
+                quantization_level: "Q4_K_M".to_string(),
             },
             model_info: ModelInfo {
                 name: req.name.clone(),
                 model: req.name.clone(),
                 modified_at: chrono::Utc::now().to_rfc3339(),
                 size: 1_073_741_824,
-                digest: "sha256:1234567890abcdef".to_string(),
+                digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
                 details: ModelDetails {
                     parent_model: "".to_string(),
-                    format: "rkllm".to_string(),
+                    format: "gguf".to_string(),
                     family: "gemma".to_string(),
                     families: Some(vec!["gemma".to_string()]),
-                    parameter_size: "1B".to_string(),
-                    quantization_level: "W8A8".to_string(),
+                    parameter_size: "2B".to_string(),
+                    quantization_level: "Q4_K_M".to_string(),
                 },
             },
         };
@@ -611,10 +627,36 @@ async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>
     }
 }
 
+async fn running_models_handler() -> Json<RunningModelsResponse> {
+    info!("Received running models request");
+    // In a real implementation, track which models are actually loaded in memory
+    // For now, simulate that our model is running
+    let response = RunningModelsResponse {
+        models: vec![RunningModelInfo {
+            name: "gemma2:2b".to_string(),
+            model: "gemma2:2b".to_string(),
+            size: 1_073_741_824,
+            digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
+            details: ModelDetails {
+                parent_model: "".to_string(),
+                format: "gguf".to_string(),
+                family: "gemma".to_string(),
+                families: Some(vec!["gemma".to_string()]),
+                parameter_size: "2B".to_string(),
+                quantization_level: "Q4_K_M".to_string(),
+            },
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+            size_vram: 1_073_741_824,
+        }],
+    };
+    info!("Returning {} running model(s)", response.models.len());
+    Json(response)
+}
+
 async fn not_found_handler(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
     warn!("Client attempted to access non-existing endpoint: {}", uri);
     error!("Requested non-existing endpoint: {}", uri);
-    debug!("Available endpoints: /api/version, /api/tags, /api/show, /api/generate, /api/chat");
+    debug!("Available endpoints: /api/version, /api/tags, /api/ps, /api/show, /api/generate, /api/chat");
     
     (
         axum::http::StatusCode::NOT_FOUND,
@@ -671,6 +713,7 @@ async fn main() {
         .route("/api/version", get(version_handler))
         .route("/api/tags", get(tags_handler))
         .route("/api/show", post(show_handler))
+        .route("/api/ps", get(running_models_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .fallback(not_found_handler)
@@ -679,6 +722,7 @@ async fn main() {
     info!("📡 Available endpoints:");
     info!("  GET  /api/version   - Server version information");
     info!("  GET  /api/tags      - List available models");
+    info!("  GET  /api/ps        - List running models");
     info!("  POST /api/show      - Show detailed model information");
     info!("  POST /api/generate  - Text generation");
     info!("  POST /api/chat      - Chat completion");
