@@ -8,6 +8,16 @@
 # Rust
 Cargo.lock
 
+# Logs and temporary files
+server.log
+*.log
+test_results_*.json
+nohup.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
 # IDE
 .vscode/
 .idea/
