@@ -1,5 +1,5 @@
 use axum::{
-    routing::post,
+    routing::{post, get},
     Router,
     Json,
     extract::State,
@@ -89,6 +89,50 @@ struct ChatResponse {
     eval_duration: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct VersionResponse {
+    version: String,
+}
+
+#[derive(Serialize)]
+struct TagsResponse {
+    models: Vec<ModelInfo>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ShowRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ShowResponse {
+    modelfile: String,
+    parameters: String,
+    template: String,
+    details: ModelDetails,
+    model_info: ModelInfo,
+}
+
+#[derive(Serialize)]
+struct ModelInfo {
+    name: String,
+    model: String,
+    modified_at: String,
+    size: u64,
+    digest: String,
+    details: ModelDetails,
+}
+
+#[derive(Serialize)]
+struct ModelDetails {
+    parent_model: String,
+    format: String,
+    family: String,
+    families: Option<Vec<String>>,
+    parameter_size: String,
+    quantization_level: String,
+}
+
 // RKLLM callback handler for collecting responses
 struct ApiCallbackHandler {
     response: Arc<Mutex<String>>,
@@ -126,8 +170,14 @@ async fn generate_handler(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, StatusCode> {
-    info!("Received generate request for model: {}", req.model);
-    debug!("Request details: prompt_length={}, stream={:?}", req.prompt.len(), req.stream);
+    info!("=== GENERATE REQUEST START ===");
+    info!("Received generate request for model: '{}'", req.model);
+    info!("Request details: prompt_length={}, stream={:?}", req.prompt.len(), req.stream);
+    debug!("Full prompt preview: {}", if req.prompt.len() > 100 { 
+        format!("{}...", &req.prompt[..100]) 
+    } else { 
+        req.prompt.clone() 
+    });
 
     let response_text = Arc::new(Mutex::new(String::new()));
     let callback = ApiCallbackHandler {
@@ -143,6 +193,8 @@ async fn generate_handler(
     let temperature = req.options.as_ref().and_then(|o| o.temperature).unwrap_or(0.8);
     let repeat_penalty = req.options.as_ref().and_then(|o| o.repeat_penalty).unwrap_or(1.1);
 
+    info!("Generate parameters: max_tokens={}, top_k={}, top_p={:.2}, temperature={:.2}, repeat_penalty={:.2}",
+           max_tokens, top_k, top_p, temperature, repeat_penalty);
     debug!("Starting RKLLM inference with params: max_tokens={}, top_k={}, top_p={}, temperature={}",
            max_tokens, top_k, top_p, temperature);
 
@@ -223,8 +275,22 @@ async fn generate_handler(
 
     match result {
         Ok(Ok((response, load_duration, prompt_eval_count, prompt_eval_duration, eval_count, eval_duration, total_duration))) => {
-            info!("Generate request completed successfully, response length: {}", response.len());
-            debug!("Generated response: {}", response);
+            let response_preview = if response.len() > 100 { 
+                format!("{}...", &response[..100]) 
+            } else { 
+                response.clone() 
+            };
+            
+            info!("Generate request completed successfully!");
+            info!("Response stats: length={} chars, estimated_tokens={}", response.len(), eval_count);
+            info!("Timing: total={:.2}ms, load={:.2}ms, prompt_eval={:.2}ms, generation={:.2}ms", 
+                  total_duration as f64 / 1_000_000.0,
+                  load_duration as f64 / 1_000_000.0,
+                  prompt_eval_duration as f64 / 1_000_000.0,
+                  eval_duration as f64 / 1_000_000.0);
+            debug!("Generated response preview: {}", response_preview);
+            info!("=== GENERATE REQUEST END ===");
+            
             Ok(Json(GenerateResponse {
                 model: req.model,
                 response,
@@ -239,11 +305,15 @@ async fn generate_handler(
             }))
         }
         Ok(Err(e)) => {
+            error!("=== GENERATE REQUEST FAILED ===");
             error!("Inference task failed: {}", e);
+            error!("Model: {}, Prompt length: {}", req.model, req.prompt.len());
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(e) => {
+            error!("=== GENERATE REQUEST FAILED ===");
             error!("Task spawn failed: {}", e);
+            error!("Model: {}, Prompt length: {}", req.model, req.prompt.len());
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -254,7 +324,21 @@ async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, StatusCode> {
-    info!("Received chat request for model: {}", req.model);
+    info!("=== CHAT REQUEST START ===");
+    info!("Received chat request for model: '{}'", req.model);
+    info!("Chat details: {} messages, stream={:?}", req.messages.len(), req.stream);
+    
+    // Log message summary
+    for (i, message) in req.messages.iter().enumerate() {
+        let content_preview = if message.content.len() > 50 { 
+            format!("{}...", &message.content[..50]) 
+        } else { 
+            message.content.clone() 
+        };
+        debug!("Message {}: role='{}', content_length={}, preview='{}'", 
+               i + 1, message.role, message.content.len(), content_preview);
+    }
+    
     debug!("Chat request with {} messages, stream={:?}", req.messages.len(), req.stream);
 
     // Convert chat messages to a single prompt
@@ -281,7 +365,12 @@ async fn chat_handler(
     prompt_parts.push("Assistant:".to_string());
 
     let prompt = prompt_parts.join("\n\n");
-    debug!("Converted chat to prompt: {}", prompt);
+    info!("Converted {} messages to prompt (length: {} chars)", req.messages.len(), prompt.len());
+    debug!("Converted chat to prompt: {}", if prompt.len() > 200 { 
+        format!("{}...", &prompt[..200]) 
+    } else { 
+        prompt.clone() 
+    });
 
     let response_text = Arc::new(Mutex::new(String::new()));
     let callback = ApiCallbackHandler {
@@ -296,6 +385,8 @@ async fn chat_handler(
     let temperature = req.options.as_ref().and_then(|o| o.temperature).unwrap_or(0.8);
     let repeat_penalty = req.options.as_ref().and_then(|o| o.repeat_penalty).unwrap_or(1.1);
 
+    info!("Chat parameters: max_tokens={}, top_k={}, top_p={:.2}, temperature={:.2}, repeat_penalty={:.2}",
+           max_tokens, top_k, top_p, temperature, repeat_penalty);
     debug!("Starting RKLLM chat inference with params: max_tokens={}, top_k={}, top_p={}, temperature={}",
            max_tokens, top_k, top_p, temperature);
 
@@ -380,16 +471,31 @@ async fn chat_handler(
 
             // Clean up the response (remove any system/user prefixes if they appear)
             if let Some(assistant_pos) = response_content.find("Assistant:") {
+                debug!("Cleaning up response: removing 'Assistant:' prefix");
                 response_content = response_content[assistant_pos + 10..].trim().to_string();
             }
 
             // If response is empty, provide a fallback
             if response_content.is_empty() {
+                warn!("Generated response was empty, using fallback message");
                 response_content = "I apologize, but I couldn't generate a response. Please try again.".to_string();
             }
 
-            info!("Chat request completed successfully, response length: {}", response_content.len());
-            debug!("Generated chat response: {}", response_content);
+            let response_preview = if response_content.len() > 100 { 
+                format!("{}...", &response_content[..100]) 
+            } else { 
+                response_content.clone() 
+            };
+
+            info!("Chat request completed successfully!");
+            info!("Response stats: length={} chars, estimated_tokens={}", response_content.len(), eval_count);
+            info!("Timing: total={:.2}ms, load={:.2}ms, prompt_eval={:.2}ms, generation={:.2}ms", 
+                  total_duration as f64 / 1_000_000.0,
+                  load_duration as f64 / 1_000_000.0,
+                  prompt_eval_duration as f64 / 1_000_000.0,
+                  eval_duration as f64 / 1_000_000.0);
+            debug!("Generated chat response preview: {}", response_preview);
+            info!("=== CHAT REQUEST END ===");
 
             Ok(Json(ChatResponse {
                 model: req.model,
@@ -409,14 +515,117 @@ async fn chat_handler(
             }))
         }
         Ok(Err(e)) => {
+            error!("=== CHAT REQUEST FAILED ===");
             error!("Chat inference task failed: {}", e);
+            error!("Model: {}, Messages: {}", req.model, req.messages.len());
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(e) => {
+            error!("=== CHAT REQUEST FAILED ===");
             error!("Chat task spawn failed: {}", e);
+            error!("Model: {}, Messages: {}", req.model, req.messages.len());
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn version_handler() -> Json<VersionResponse> {
+    info!("Received version request");
+    debug!("Returning server version: 1.0.0");
+    Json(VersionResponse {
+        version: "1.0.0".to_string(),
+    })
+}
+
+async fn tags_handler() -> Json<TagsResponse> {
+    info!("Received tags request - listing available models");
+    // Return information about the available model
+    // In a real implementation, you might scan a models directory or maintain a registry
+    let response = TagsResponse {
+        models: vec![ModelInfo {
+            name: "gemma3:1b".to_string(),
+            model: "gemma3:1b".to_string(),
+            modified_at: chrono::Utc::now().to_rfc3339(),
+            size: 1_073_741_824, // 1GB in bytes
+            digest: "sha256:1234567890abcdef".to_string(),
+            details: ModelDetails {
+                parent_model: "".to_string(),
+                format: "rkllm".to_string(),
+                family: "gemma".to_string(),
+                families: Some(vec!["gemma".to_string()]),
+                parameter_size: "1B".to_string(),
+                quantization_level: "W8A8".to_string(),
+            },
+        }],
+    };
+    info!("Returning {} available model(s)", response.models.len());
+    debug!("Available models: {:?}", response.models.iter().map(|m| &m.name).collect::<Vec<_>>());
+    Json(response)
+}
+
+async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>, StatusCode> {
+    info!("Received show request for model: '{}'", req.name);
+    debug!("Processing model information request for: {}", req.name);
+    
+    // For now, return information about our single model
+    // In a real implementation, you'd look up the specific model
+    if req.name == "gemma3:1b" || req.name.starts_with("gemma") {
+        info!("Model '{}' found, returning detailed information", req.name);
+        debug!("Generating modelfile and template information for: {}", req.name);
+        
+        let response = ShowResponse {
+            modelfile: "FROM gemma3:1b\nPARAMETER temperature 0.8\nPARAMETER top_p 0.9".to_string(),
+            parameters: "temperature 0.8\ntop_p 0.9\ntop_k 40\nrepeat_penalty 1.1".to_string(),
+            template: "{{ if .System }}System: {{ .System }}\n\n{{ end }}{{ if .Prompt }}User: {{ .Prompt }}\n\nAssistant: {{ end }}".to_string(),
+            details: ModelDetails {
+                parent_model: "".to_string(),
+                format: "rkllm".to_string(),
+                family: "gemma".to_string(),
+                families: Some(vec!["gemma".to_string()]),
+                parameter_size: "1B".to_string(),
+                quantization_level: "W8A8".to_string(),
+            },
+            model_info: ModelInfo {
+                name: req.name.clone(),
+                model: req.name.clone(),
+                modified_at: chrono::Utc::now().to_rfc3339(),
+                size: 1_073_741_824,
+                digest: "sha256:1234567890abcdef".to_string(),
+                details: ModelDetails {
+                    parent_model: "".to_string(),
+                    format: "rkllm".to_string(),
+                    family: "gemma".to_string(),
+                    families: Some(vec!["gemma".to_string()]),
+                    parameter_size: "1B".to_string(),
+                    quantization_level: "W8A8".to_string(),
+                },
+            },
+        };
+        
+        debug!("Model info response prepared for '{}' - size: {} bytes", req.name, response.model_info.size);
+        Ok(Json(response))
+    } else {
+        warn!("Model '{}' not found in available models", req.name);
+        error!("Requested model '{}' not found", req.name);
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn not_found_handler(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
+    warn!("Client attempted to access non-existing endpoint: {}", uri);
+    error!("Requested non-existing endpoint: {}", uri);
+    debug!("Available endpoints: /api/version, /api/tags, /api/show, /api/generate, /api/chat");
+    
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!("Endpoint '{}' not found", uri),
+                "type": "not_found",
+                "code": 404
+            }
+        }))
+    )
 }
 
 #[tokio::main]
@@ -430,31 +639,70 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Starting Platinenmachergpt server...");
+    info!("🚀 Starting Platinenmachergpt server...");
+    info!("Version: 1.0.0");
+    info!("Build: Rust compilation");
 
     // Load environment variables from .env file
     dotenv().ok();
+    info!("Environment variables loaded from .env file");
 
     // For now, we'll initialize the model per request
     // In production, you might want to load it once and reuse
     let model_path = std::env::var("MODEL_PATH")
         .unwrap_or_else(|_| "/path/to/your/model.rkllm".to_string());
 
-    info!("Using model path: {}", model_path);
+    info!("📁 Using model path: {}", model_path);
+    debug!("Model path source: {}", if std::env::var("MODEL_PATH").is_ok() { 
+        "environment variable" 
+    } else { 
+        "default fallback" 
+    });
 
     let state = AppState {
         llm_handle: Arc::new(Mutex::new(None)),
-        model_path,
+        model_path: model_path.clone(),
     };
 
+    info!("🔧 Configuring API endpoints...");
     let app = Router::new()
         .route("/api/generate", post(generate_handler))
         .route("/api/chat", post(chat_handler))
+        .route("/api/version", get(version_handler))
+        .route("/api/tags", get(tags_handler))
+        .route("/api/show", post(show_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        .fallback(not_found_handler)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:11434").await.unwrap();
-    info!("🚀 Platinenmachergpt server listening on http://0.0.0.0:11434");
-    axum::serve(listener, app).await.unwrap();
+    info!("📡 Available endpoints:");
+    info!("  GET  /api/version   - Server version information");
+    info!("  GET  /api/tags      - List available models");
+    info!("  POST /api/show      - Show detailed model information");
+    info!("  POST /api/generate  - Text generation");
+    info!("  POST /api/chat      - Chat completion");
+
+    let bind_address = "0.0.0.0:11434";
+    info!("🌐 Binding to address: {}", bind_address);
+    
+    let listener = match tokio::net::TcpListener::bind(bind_address).await {
+        Ok(listener) => {
+            info!("✅ Successfully bound to {}", bind_address);
+            listener
+        }
+        Err(e) => {
+            error!("❌ Failed to bind to {}: {}", bind_address, e);
+            std::process::exit(1);
+        }
+    };
+
+    info!("🚀 Platinenmachergpt server listening on http://{}", bind_address);
+    info!("📋 Server ready to accept requests!");
+    info!("=== SERVER STARTUP COMPLETE ===");
+    
+    if let Err(e) = axum::serve(listener, app).await {
+        error!("❌ Server error: {}", e);
+        std::process::exit(1);
+    }
 }
