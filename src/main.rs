@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use dotenv::dotenv;
 use tracing::{info, warn, error, debug, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 #[derive(Deserialize, Debug)]
 struct GenerateRequest {
@@ -61,7 +62,7 @@ struct ChatRequest {
     options: Option<GenerateOptions>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct Message {
     role: String,
     content: String,
@@ -117,7 +118,54 @@ struct RunningModelInfo {
 
 #[derive(Deserialize, Debug)]
 struct ShowRequest {
-    name: String,
+    model: String,
+    #[serde(default)]
+    verbose: Option<bool>,
+}
+
+// OpenAI-compatible API structures
+#[derive(Deserialize, Debug)]
+struct OpenAIChatRequest {
+    model: String,
+    messages: Vec<OpenAIMessage>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_tokens: Option<i32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct OpenAIMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct OpenAIChatResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<OpenAIChoice>,
+    usage: OpenAIUsage,
+}
+
+#[derive(Serialize)]
+struct OpenAIChoice {
+    index: i32,
+    message: OpenAIMessage,
+    finish_reason: String,
+}
+
+#[derive(Serialize)]
+struct OpenAIUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -180,6 +228,10 @@ impl RkllmCallbackHandler for ApiCallbackHandler {
 struct AppState {
     llm_handle: Arc<Mutex<Option<LLMHandle>>>,
     model_path: String,
+    max_context_len: i32,
+    max_new_tokens_default: i32,
+    max_new_tokens_limit: i32,
+    max_prompt_length: usize,
 }
 
 #[instrument(skip(state))]
@@ -196,23 +248,10 @@ async fn generate_handler(
         req.prompt.clone() 
     });
 
-    // TEMPORARY: Quick mock response for VS Code compatibility testing
-    // Remove this block to enable actual RKLLM inference
-    if req.prompt.len() <= 10 && (req.prompt.contains("Hi") || req.prompt.contains("test") || req.prompt.contains("hello")) {
-        info!("Returning mock response for VS Code compatibility test");
-        let mock_response = GenerateResponse {
-            model: req.model.clone(),
-            response: "Hello! This is a test response from the Ollama-compatible API server.".to_string(),
-            done: true,
-            done_reason: Some("stop".to_string()),
-            total_duration: Some(150_000_000), // 150ms
-            load_duration: Some(50_000_000),   // 50ms  
-            prompt_eval_count: Some((req.prompt.len() / 4) as u32),
-            prompt_eval_duration: Some(25_000_000), // 25ms
-            eval_count: Some(15),
-            eval_duration: Some(75_000_000), // 75ms
-        };
-        return Ok(Json(mock_response));
+    // Validate prompt length
+    if req.prompt.len() > state.max_prompt_length {
+        error!("Prompt too long: {} characters > {} limit", req.prompt.len(), state.max_prompt_length);
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let response_text = Arc::new(Mutex::new(String::new()));
@@ -223,11 +262,33 @@ async fn generate_handler(
     // Run inference in a blocking task
     let model_path = state.model_path.clone();
     let prompt = req.prompt.clone();
-    let max_tokens = req.options.as_ref().and_then(|o| o.max_tokens).unwrap_or(256);
+    let requested_max_tokens = req.options.as_ref().and_then(|o| o.max_tokens).unwrap_or(state.max_new_tokens_default);
+    let max_tokens = std::cmp::min(requested_max_tokens, state.max_new_tokens_limit);
+    
+    // Estimate prompt tokens (rough approximation: ~4 chars per token)
+    let estimated_prompt_tokens = (req.prompt.len() / 4) as i32;
+    
+    // Ensure prompt + max_tokens doesn't exceed context length
+    let max_tokens = if estimated_prompt_tokens + max_tokens > state.max_context_len {
+        let available_tokens = state.max_context_len - estimated_prompt_tokens;
+        if available_tokens <= 0 {
+            error!("Prompt too long for context: estimated {} tokens > {} context limit", 
+                   estimated_prompt_tokens, state.max_context_len);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let adjusted_max_tokens = std::cmp::min(max_tokens, available_tokens);
+        warn!("Adjusted max_tokens from {} to {} to fit context window (estimated prompt: {} tokens)", 
+              max_tokens, adjusted_max_tokens, estimated_prompt_tokens);
+        adjusted_max_tokens
+    } else {
+        max_tokens
+    };
+    
     let top_k = req.options.as_ref().and_then(|o| o.top_k).unwrap_or(40);
     let top_p = req.options.as_ref().and_then(|o| o.top_p).unwrap_or(0.9);
     let temperature = req.options.as_ref().and_then(|o| o.temperature).unwrap_or(0.8);
     let repeat_penalty = req.options.as_ref().and_then(|o| o.repeat_penalty).unwrap_or(1.1);
+    let max_context_len = state.max_context_len;
 
     info!("Generate parameters: max_tokens={}, top_k={}, top_p={:.2}, temperature={:.2}, repeat_penalty={:.2}",
            max_tokens, top_k, top_p, temperature, repeat_penalty);
@@ -241,7 +302,7 @@ async fn generate_handler(
         let model_path_cstr = std::ffi::CString::new(model_path)?;
         let mut param = RKLLMParam {
             model_path: model_path_cstr.as_ptr() as *const std::os::raw::c_char,
-            max_context_len: 1024,
+            max_context_len: max_context_len,
             max_new_tokens: max_tokens,
             top_k: top_k,
             top_p: top_p,
@@ -377,36 +438,6 @@ async fn chat_handler(
     
     debug!("Chat request with {} messages, stream={:?}", req.messages.len(), req.stream);
 
-    // TEMPORARY: Quick mock response for VS Code compatibility testing
-    // Remove this block to enable actual RKLLM inference
-    if req.messages.len() <= 2 {
-        if let Some(last_message) = req.messages.last() {
-            if last_message.content.len() <= 20 && 
-               (last_message.content.to_lowercase().contains("hi") || 
-                last_message.content.to_lowercase().contains("test") || 
-                last_message.content.to_lowercase().contains("hello")) {
-                info!("Returning mock chat response for VS Code compatibility test");
-                let mock_response = ChatResponse {
-                    model: req.model.clone(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    message: Message {
-                        role: "assistant".to_string(),
-                        content: "Hello! I'm a test response from the Ollama-compatible chat API.".to_string(),
-                    },
-                    done: true,
-                    done_reason: Some("stop".to_string()),
-                    total_duration: Some(180_000_000), // 180ms
-                    load_duration: Some(60_000_000),   // 60ms
-                    prompt_eval_count: Some(req.messages.iter().map(|m| (m.content.len() / 4) as u32).sum()),
-                    prompt_eval_duration: Some(40_000_000), // 40ms
-                    eval_count: Some(18),
-                    eval_duration: Some(80_000_000), // 80ms
-                };
-                return Ok(Json(mock_response));
-            }
-        }
-    }
-
     // Convert chat messages to a single prompt
     let mut prompt_parts = Vec::new();
 
@@ -438,6 +469,12 @@ async fn chat_handler(
         prompt.clone() 
     });
 
+    // Validate prompt length
+    if prompt.len() > state.max_prompt_length {
+        error!("Chat prompt too long: {} characters > {} limit", prompt.len(), state.max_prompt_length);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let response_text = Arc::new(Mutex::new(String::new()));
     let callback = ApiCallbackHandler {
         response: Arc::clone(&response_text),
@@ -445,11 +482,32 @@ async fn chat_handler(
 
     // Run inference in a blocking task
     let model_path = state.model_path.clone();
-    let max_tokens = req.options.as_ref().and_then(|o| o.max_tokens).unwrap_or(256);
+    let requested_max_tokens = req.options.as_ref().and_then(|o| o.max_tokens).unwrap_or(state.max_new_tokens_default);
+    let max_tokens = std::cmp::min(requested_max_tokens, state.max_new_tokens_limit);
+    
+    // Estimate prompt tokens (rough approximation: ~4 chars per token)
+    let estimated_prompt_tokens = (prompt.len() / 4) as i32;
+    
+    // Ensure prompt + max_tokens doesn't exceed context length
+    let max_tokens = if estimated_prompt_tokens + max_tokens > state.max_context_len {
+        let available_tokens = state.max_context_len - estimated_prompt_tokens;
+        if available_tokens <= 0 {
+            error!("Chat prompt too long for context: estimated {} tokens > {} context limit", 
+                   estimated_prompt_tokens, state.max_context_len);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let adjusted_max_tokens = std::cmp::min(max_tokens, available_tokens);
+        warn!("Adjusted chat max_tokens from {} to {} to fit context window (estimated prompt: {} tokens)", 
+              max_tokens, adjusted_max_tokens, estimated_prompt_tokens);
+        adjusted_max_tokens
+    } else {
+        max_tokens
+    };
     let top_k = req.options.as_ref().and_then(|o| o.top_k).unwrap_or(40);
     let top_p = req.options.as_ref().and_then(|o| o.top_p).unwrap_or(0.9);
     let temperature = req.options.as_ref().and_then(|o| o.temperature).unwrap_or(0.8);
     let repeat_penalty = req.options.as_ref().and_then(|o| o.repeat_penalty).unwrap_or(1.1);
+    let max_context_len = state.max_context_len;
 
     info!("Chat parameters: max_tokens={}, top_k={}, top_p={:.2}, temperature={:.2}, repeat_penalty={:.2}",
            max_tokens, top_k, top_p, temperature, repeat_penalty);
@@ -463,7 +521,7 @@ async fn chat_handler(
         let model_path_cstr = std::ffi::CString::new(model_path)?;
         let mut param = RKLLMParam {
             model_path: model_path_cstr.as_ptr() as *const std::os::raw::c_char,
-            max_context_len: 1024,
+            max_context_len: max_context_len,
             max_new_tokens: max_tokens,
             top_k: top_k,
             top_p: top_p,
@@ -613,12 +671,12 @@ async fn tags_handler() -> Json<TagsResponse> {
             model: "gemma2:2b".to_string(),
             modified_at: chrono::Utc::now().to_rfc3339(),
             size: 1_073_741_824, // 1GB in bytes
-            digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
+            digest: "6577803aa9a036369e481d648a2baebb381ebc6e897f2bb9a766a2aa7bfbc1cf".to_string(),
             details: ModelDetails {
                 parent_model: "".to_string(),
                 format: "gguf".to_string(),
-                family: "gemma".to_string(),
-                families: Some(vec!["gemma".to_string()]),
+                family: "gemma3".to_string(),
+                families: Some(vec!["gemma3".to_string()]),
                 parameter_size: "2B".to_string(),
                 quantization_level: "Q4_K_M".to_string(),
             },
@@ -630,14 +688,14 @@ async fn tags_handler() -> Json<TagsResponse> {
 }
 
 async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>, StatusCode> {
-    info!("Received show request for model: '{}'", req.name);
-    debug!("Processing model information request for: {}", req.name);
+    info!("Received show request for model: '{}'", req.model);
+    debug!("Processing model information request for: {}", req.model);
     
     // For now, return information about our single model
     // In a real implementation, you'd look up the specific model
-    if req.name == "gemma2:2b" || req.name.starts_with("gemma") {
-        info!("Model '{}' found, returning detailed information", req.name);
-        debug!("Generating modelfile and template information for: {}", req.name);
+    if req.model == "gemma2:2b" || req.model.starts_with("gemma") {
+        info!("Model '{}' found, returning detailed information", req.model);
+        debug!("Generating modelfile and template information for: {}", req.model);
         
         let response = ShowResponse {
             modelfile: "FROM gemma2:2b\nPARAMETER temperature 0.8\nPARAMETER top_p 0.9".to_string(),
@@ -652,8 +710,8 @@ async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>
                 quantization_level: "Q4_K_M".to_string(),
             },
             model_info: ModelInfo {
-                name: req.name.clone(),
-                model: req.name.clone(),
+                name: req.model.clone(),
+                model: req.model.clone(),
                 modified_at: chrono::Utc::now().to_rfc3339(),
                 size: 1_073_741_824,
                 digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
@@ -669,11 +727,11 @@ async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>
             capabilities: vec!["completion".to_string(), "chat".to_string()],
         };
         
-        debug!("Model info response prepared for '{}' - size: {} bytes", req.name, response.model_info.size);
+        debug!("Model info response prepared for '{}' - size: {} bytes", req.model, response.model_info.size);
         Ok(Json(response))
     } else {
-        warn!("Model '{}' not found in available models", req.name);
-        error!("Requested model '{}' not found", req.name);
+        warn!("Model '{}' not found in available models", req.model);
+        error!("Requested model '{}' not found", req.model);
         Err(StatusCode::NOT_FOUND)
     }
 }
@@ -704,10 +762,101 @@ async fn running_models_handler() -> Json<RunningModelsResponse> {
     Json(response)
 }
 
+#[instrument(skip(state))]
+async fn openai_chat_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OpenAIChatRequest>,
+) -> Result<Json<OpenAIChatResponse>, StatusCode> {
+    info!("=== OPENAI CHAT REQUEST START ===");
+    info!("Received OpenAI chat request for model: '{}'", req.model);
+    info!("Chat details: {} messages, stream={:?}", req.messages.len(), req.stream);
+    debug!("OpenAI request: model='{}', temp={:?}, max_tokens={:?}, top_p={:?}", 
+           req.model, req.temperature, req.max_tokens, req.top_p);
+    
+    // Log message summary
+    for (i, message) in req.messages.iter().enumerate() {
+        let content_preview = if message.content.len() > 50 { 
+            format!("{}...", &message.content[..50]) 
+        } else { 
+            message.content.clone() 
+        };
+        debug!("Message {}: role='{}', content_length={}, preview='{}'", 
+               i + 1, message.role, message.content.len(), content_preview);
+    }
+
+    // Convert OpenAI request to our internal format
+    let ollama_messages: Vec<Message> = req.messages.iter().map(|msg| Message {
+        role: msg.role.clone(),
+        content: msg.content.clone(),
+    }).collect();
+
+    let options = GenerateOptions {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: None,
+        max_tokens: req.max_tokens,
+        repeat_penalty: None,
+    };
+
+    let chat_request = ChatRequest {
+        model: req.model.clone(),
+        messages: ollama_messages.clone(),
+        stream: req.stream,
+        options: Some(options),
+    };
+
+    debug!("Converted to Ollama format: model='{}', {} messages", 
+           chat_request.model, chat_request.messages.len());
+    debug!("Calling internal chat_handler...");
+
+    // Use existing chat handler logic
+    match chat_handler(State(state), Json(chat_request)).await {
+        Ok(Json(chat_response)) => {
+            info!("OpenAI chat request completed successfully!");
+            
+            // Convert response to OpenAI format
+            let openai_response = OpenAIChatResponse {
+                id: format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', "")),
+                object: "chat.completion".to_string(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                model: req.model,
+                choices: vec![OpenAIChoice {
+                    index: 0,
+                    message: OpenAIMessage {
+                        role: chat_response.message.role,
+                        content: chat_response.message.content,
+                    },
+                    finish_reason: "stop".to_string(),
+                }],
+                usage: OpenAIUsage {
+                    prompt_tokens: chat_response.prompt_eval_count.unwrap_or(0),
+                    completion_tokens: chat_response.eval_count.unwrap_or(0),
+                    total_tokens: chat_response.prompt_eval_count.unwrap_or(0) + chat_response.eval_count.unwrap_or(0),
+                },
+            };
+
+            info!("=== OPENAI CHAT REQUEST END ===");
+            Ok(Json(openai_response))
+        }
+        Err(status) => {
+            error!("=== OPENAI CHAT REQUEST FAILED ===");
+            error!("Chat handler returned error: {:?}", status);
+            error!("Request details: model='{}', {} messages", req.model, req.messages.len());
+            for (i, msg) in req.messages.iter().enumerate() {
+                error!("  Message {}: role='{}', content='{}'", i+1, msg.role, msg.content);
+            }
+            Err(status)
+        }
+    }
+}
+
 async fn not_found_handler(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
     warn!("Client attempted to access non-existing endpoint: {}", uri);
     error!("Requested non-existing endpoint: {}", uri);
-    debug!("Available endpoints: /api/version, /api/tags, /api/ps, /api/show, /api/generate, /api/chat");
+    debug!("Available endpoints: /api/version, /api/tags, /api/ps, /api/show, /api/generate, /api/chat, /v1/chat/completions");
     
     (
         axum::http::StatusCode::NOT_FOUND,
@@ -727,9 +876,13 @@ async fn main() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "platinenmachergpt=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "debug".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+        )
         .init();
 
     info!("🚀 Starting Platinenmachergpt server...");
@@ -745,7 +898,30 @@ async fn main() {
     let model_path = std::env::var("MODEL_PATH")
         .unwrap_or_else(|_| "/path/to/your/model.rkllm".to_string());
 
+    // Memory and context limits configuration
+    let max_context_len: i32 = std::env::var("MAX_CONTEXT_LEN")
+        .unwrap_or_else(|_| "512".to_string())
+        .parse()
+        .unwrap_or(512);
+    
+    let max_new_tokens_default: i32 = std::env::var("MAX_NEW_TOKENS_DEFAULT")
+        .unwrap_or_else(|_| "128".to_string())
+        .parse()
+        .unwrap_or(128);
+    
+    let max_new_tokens_limit: i32 = std::env::var("MAX_NEW_TOKENS_LIMIT")
+        .unwrap_or_else(|_| "256".to_string())
+        .parse()
+        .unwrap_or(256);
+    
+    let max_prompt_length: usize = std::env::var("MAX_PROMPT_LENGTH")
+        .unwrap_or_else(|_| "2048".to_string())
+        .parse()
+        .unwrap_or(2048);
+
     info!("📁 Using model path: {}", model_path);
+    info!("🧠 Memory limits: max_context_len={}, max_new_tokens_default={}, max_new_tokens_limit={}, max_prompt_length={}", 
+          max_context_len, max_new_tokens_default, max_new_tokens_limit, max_prompt_length);
     debug!("Model path source: {}", if std::env::var("MODEL_PATH").is_ok() { 
         "environment variable" 
     } else { 
@@ -755,6 +931,10 @@ async fn main() {
     let state = AppState {
         llm_handle: Arc::new(Mutex::new(None)),
         model_path: model_path.clone(),
+        max_context_len,
+        max_new_tokens_default,
+        max_new_tokens_limit,
+        max_prompt_length,
     };
 
     info!("🔧 Configuring API endpoints...");
@@ -765,6 +945,7 @@ async fn main() {
         .route("/api/tags", get(tags_handler))
         .route("/api/show", post(show_handler))
         .route("/api/ps", get(running_models_handler))
+        .route("/v1/chat/completions", post(openai_chat_handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .fallback(not_found_handler)
@@ -777,6 +958,7 @@ async fn main() {
     info!("  POST /api/show      - Show detailed model information");
     info!("  POST /api/generate  - Text generation");
     info!("  POST /api/chat      - Chat completion");
+    info!("  POST /v1/chat/completions - OpenAI-compatible chat completion");
 
     let bind_address = "0.0.0.0:11434";
     info!("🌐 Binding to address: {}", bind_address);
