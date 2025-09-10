@@ -438,32 +438,30 @@ async fn chat_handler(
     
     debug!("Chat request with {} messages, stream={:?}", req.messages.len(), req.stream);
 
-    // Convert chat messages to a single prompt
-    let mut prompt_parts = Vec::new();
+    // Convert chat messages to a natural conversation format for the model
+    let mut conversation_parts = Vec::new();
 
     for message in &req.messages {
         match message.role.as_str() {
             "system" => {
-                prompt_parts.push(format!("System: {}", message.content));
+                // System messages can be included naturally
+                conversation_parts.push(message.content.clone());
             }
-            "user" => {
-                prompt_parts.push(format!("User: {}", message.content));
-            }
-            "assistant" => {
-                prompt_parts.push(format!("Assistant: {}", message.content));
+            "user" | "assistant" => {
+                // Include user and assistant messages as natural conversation
+                conversation_parts.push(message.content.clone());
             }
             _ => {
-                debug!("Unknown message role: {}", message.role);
+                debug!("Unknown message role: {}, including content as-is", message.role);
+                conversation_parts.push(message.content.clone());
             }
         }
     }
 
-    // Add the assistant prompt
-    prompt_parts.push("Assistant:".to_string());
-
-    let prompt = prompt_parts.join("\n\n");
-    info!("Converted {} messages to prompt (length: {} chars)", req.messages.len(), prompt.len());
-    debug!("Converted chat to prompt: {}", if prompt.len() > 200 { 
+    // Create a natural conversation prompt without artificial role prefixes
+    let prompt = conversation_parts.join("\n\n");
+    info!("Converted {} messages to natural conversation prompt (length: {} chars)", req.messages.len(), prompt.len());
+    debug!("Conversation prompt preview: {}", if prompt.len() > 200 { 
         format!("{}...", &prompt[..200]) 
     } else { 
         prompt.clone() 
@@ -591,28 +589,25 @@ async fn chat_handler(
 
     match result {
         Ok(Ok((response, load_duration, prompt_eval_count, prompt_eval_duration, eval_count, eval_duration, total_duration))) => {
-            let mut response_content = response;
+            // Use the model's response as-is, without any content manipulation
+            let response_content = response.trim().to_string();
 
-            // Clean up the response (remove any system/user prefixes if they appear)
-            if let Some(assistant_pos) = response_content.find("Assistant:") {
-                debug!("Cleaning up response: removing 'Assistant:' prefix");
-                response_content = response_content[assistant_pos + 10..].trim().to_string();
-            }
-
-            // If response is empty, provide a fallback
-            if response_content.is_empty() {
+            // Only handle truly empty responses
+            let final_response_content = if response_content.is_empty() {
                 warn!("Generated response was empty, using fallback message");
-                response_content = "I apologize, but I couldn't generate a response. Please try again.".to_string();
-            }
+                "I apologize, but I couldn't generate a response. Please try again.".to_string()
+            } else {
+                response_content
+            };
 
-            let response_preview = if response_content.len() > 100 { 
-                format!("{}...", &response_content[..100]) 
+            let response_preview = if final_response_content.len() > 100 { 
+                format!("{}...", &final_response_content[..100]) 
             } else { 
-                response_content.clone() 
+                final_response_content.clone() 
             };
 
             info!("Chat request completed successfully!");
-            info!("Response stats: length={} chars, estimated_tokens={}", response_content.len(), eval_count);
+            info!("Response stats: length={} chars, estimated_tokens={}", final_response_content.len(), eval_count);
             info!("Timing: total={:.2}ms, load={:.2}ms, prompt_eval={:.2}ms, generation={:.2}ms", 
                   total_duration as f64 / 1_000_000.0,
                   load_duration as f64 / 1_000_000.0,
@@ -626,7 +621,7 @@ async fn chat_handler(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 message: Message {
                     role: "assistant".to_string(),
-                    content: response_content,
+                    content: final_response_content,
                 },
                 done: true,
                 done_reason: Some("stop".to_string()),
