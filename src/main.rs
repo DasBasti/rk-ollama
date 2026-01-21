@@ -7,14 +7,158 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 use rkllm_rs::prelude::*;
 use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 use dotenv::dotenv;
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{info, warn, error, debug};
+use regex::Regex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+
+/// Resolve the model path based on the model name from the request.
+/// Searches in MODEL_PATH directory (if it's a directory) or the current working directory
+/// for a file named `<model_name>.rkllm`.
+/// 
+/// Returns the full path to the model file if found, or an error message.
+fn resolve_model_path(model_name: &str, base_model_path: &str) -> Result<PathBuf, String> {
+    // Clean the model name (remove any path separators for security)
+    let clean_model_name = model_name
+        .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "")
+        .trim()
+        .to_string();
+    
+    if clean_model_name.is_empty() {
+        return Err("Model name cannot be empty".to_string());
+    }
+    
+    // Build the expected filename
+    let model_filename = if clean_model_name.ends_with(".rkllm") {
+        clean_model_name.clone()
+    } else {
+        format!("{}.rkllm", clean_model_name)
+    };
+    
+    debug!("Looking for model file: {}", model_filename);
+    
+    // Check if MODEL_PATH is a directory or a file
+    let base_path = Path::new(base_model_path);
+    
+    // Search locations in order of priority:
+    // 1. If MODEL_PATH is a directory, look for the model file there
+    // 2. Current working directory
+    // 3. MODEL_PATH parent directory (if MODEL_PATH is a file)
+    
+    let mut search_paths: Vec<PathBuf> = Vec::new();
+    
+    if base_path.is_dir() {
+        // MODEL_PATH is a directory - look for model file inside it
+        search_paths.push(base_path.join(&model_filename));
+        // Also check subdirectories with the model name
+        search_paths.push(base_path.join(&clean_model_name).join(&model_filename));
+    } else if base_path.is_file() {
+        // MODEL_PATH is a file - check its parent directory
+        if let Some(parent) = base_path.parent() {
+            search_paths.push(parent.join(&model_filename));
+        }
+    }
+    
+    // Add current working directory as fallback
+    if let Ok(cwd) = std::env::current_dir() {
+        search_paths.push(cwd.join(&model_filename));
+        // Also check a 'models' subdirectory in cwd
+        search_paths.push(cwd.join("models").join(&model_filename));
+    }
+    
+    // Try each search path
+    for path in &search_paths {
+        debug!("Checking path: {:?}", path);
+        if path.exists() && path.is_file() {
+            info!("Found model file at: {:?}", path);
+            return Ok(path.clone());
+        }
+    }
+    
+    // If not found, return a helpful error message
+    Err(format!(
+        "Model '{}' not found. Searched for '{}' in: {:?}",
+        model_name,
+        model_filename,
+        search_paths
+    ))
+}
+
+/// List all available .rkllm model files in the search paths
+fn list_available_models(base_model_path: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    
+    let base_path = Path::new(base_model_path);
+    
+    if base_path.is_dir() {
+        search_dirs.push(base_path.to_path_buf());
+    } else if let Some(parent) = base_path.parent() {
+        if parent.is_dir() {
+            search_dirs.push(parent.to_path_buf());
+        }
+    }
+    
+    if let Ok(cwd) = std::env::current_dir() {
+        search_dirs.push(cwd.clone());
+        let models_dir = cwd.join("models");
+        if models_dir.is_dir() {
+            search_dirs.push(models_dir);
+        }
+    }
+    
+    for dir in search_dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        if ext == "rkllm" {
+                            if let Some(stem) = path.file_stem() {
+                                let model_name = stem.to_string_lossy().to_string();
+                                if !models.contains(&model_name) {
+                                    models.push(model_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    models
+}
+
+/// Clean response content by removing thinking tags and extra whitespace
+fn clean_response_content(content: &str) -> String {
+    // Remove complete <think>...</think> blocks (case insensitive, multiline)
+    let think_complete_regex = Regex::new(r"(?si)<think\s*>.*?</think\s*>").unwrap();
+    let cleaned = think_complete_regex.replace_all(content, "");
+    
+    // Remove incomplete <think> blocks (everything from <think> to end if no closing tag)
+    let think_incomplete_regex = Regex::new(r"(?si)<think\s*>.*$").unwrap();
+    let cleaned = think_incomplete_regex.replace_all(&cleaned, "");
+    
+    // Clean up extra whitespace and newlines
+    let whitespace_regex = Regex::new(r"\n\s*\n\s*\n").unwrap();
+    let trimmed = whitespace_regex.replace_all(&cleaned, "\n\n");
+    
+    // Final cleanup: trim and ensure no leading/trailing whitespace
+    let result = trimmed.trim().to_string();
+    
+    // If result is empty or very short, provide a fallback response
+    if result.is_empty() || result.len() < 10 {
+        "I understand your request. How can I help you?".to_string()
+    } else {
+        result
+    }
+}
 
 #[derive(Deserialize, Debug)]
 struct GenerateRequest {
@@ -234,7 +378,6 @@ struct AppState {
     max_prompt_length: usize,
 }
 
-#[instrument(skip(state))]
 async fn generate_handler(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
@@ -248,6 +391,18 @@ async fn generate_handler(
         req.prompt.clone() 
     });
 
+    // Resolve the model path based on the model name in the request
+    let resolved_model_path = match resolve_model_path(&req.model, &state.model_path) {
+        Ok(path) => {
+            info!("Resolved model '{}' to path: {:?}", req.model, path);
+            path.to_string_lossy().to_string()
+        }
+        Err(e) => {
+            error!("Failed to resolve model '{}': {}", req.model, e);
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
+
     // Validate prompt length
     if req.prompt.len() > state.max_prompt_length {
         error!("Prompt too long: {} characters > {} limit", req.prompt.len(), state.max_prompt_length);
@@ -260,7 +415,7 @@ async fn generate_handler(
     };
 
     // Run inference in a blocking task
-    let model_path = state.model_path.clone();
+    let model_path = resolved_model_path;
     let prompt = req.prompt.clone();
     let requested_max_tokens = req.options.as_ref().and_then(|o| o.max_tokens).unwrap_or(state.max_new_tokens_default);
     let max_tokens = std::cmp::min(requested_max_tokens, state.max_new_tokens_limit);
@@ -416,7 +571,6 @@ async fn generate_handler(
     }
 }
 
-#[instrument(skip(state))]
 async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
@@ -424,6 +578,18 @@ async fn chat_handler(
     info!("=== CHAT REQUEST START ===");
     info!("Received chat request for model: '{}'", req.model);
     info!("Chat details: {} messages, stream={:?}", req.messages.len(), req.stream);
+    
+    // Resolve the model path based on the model name in the request
+    let resolved_model_path = match resolve_model_path(&req.model, &state.model_path) {
+        Ok(path) => {
+            info!("Resolved model '{}' to path: {:?}", req.model, path);
+            path.to_string_lossy().to_string()
+        }
+        Err(e) => {
+            error!("Failed to resolve model '{}': {}", req.model, e);
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
     
     // Log message summary
     for (i, message) in req.messages.iter().enumerate() {
@@ -479,7 +645,7 @@ async fn chat_handler(
     };
 
     // Run inference in a blocking task
-    let model_path = state.model_path.clone();
+    let model_path = resolved_model_path;
     let requested_max_tokens = req.options.as_ref().and_then(|o| o.max_tokens).unwrap_or(state.max_new_tokens_default);
     let max_tokens = std::cmp::min(requested_max_tokens, state.max_new_tokens_limit);
     
@@ -656,117 +822,144 @@ async fn version_handler() -> Json<VersionResponse> {
     })
 }
 
-async fn tags_handler() -> Json<TagsResponse> {
+async fn tags_handler(State(state): State<AppState>) -> Json<TagsResponse> {
     info!("Received tags request - listing available models");
-    // Return information about the available model
-    // In a real implementation, you might scan a models directory or maintain a registry
-    let response = TagsResponse {
-        models: vec![ModelInfo {
-            name: "gemma2:2b".to_string(),
-            model: "gemma2:2b".to_string(),
+    
+    // Dynamically list available .rkllm models from the search paths
+    let available_models = list_available_models(&state.model_path);
+    
+    let models: Vec<ModelInfo> = available_models.iter().map(|model_name| {
+        // Try to get file size if possible
+        let size = resolve_model_path(model_name, &state.model_path)
+            .ok()
+            .and_then(|path| std::fs::metadata(&path).ok())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        
+        ModelInfo {
+            name: model_name.clone(),
+            model: model_name.clone(),
             modified_at: chrono::Utc::now().to_rfc3339(),
-            size: 1_073_741_824, // 1GB in bytes
-            digest: "6577803aa9a036369e481d648a2baebb381ebc6e897f2bb9a766a2aa7bfbc1cf".to_string(),
+            size,
+            digest: format!("sha256:{:064x}", model_name.as_bytes().iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))),
             details: ModelDetails {
                 parent_model: "".to_string(),
-                format: "gguf".to_string(),
-                family: "gemma3".to_string(),
-                families: Some(vec!["gemma3".to_string()]),
-                parameter_size: "2B".to_string(),
-                quantization_level: "Q4_K_M".to_string(),
+                format: "rkllm".to_string(),
+                family: "rkllm".to_string(),
+                families: Some(vec!["rkllm".to_string()]),
+                parameter_size: "unknown".to_string(),
+                quantization_level: "unknown".to_string(),
             },
-        }],
-    };
+        }
+    }).collect();
+    
+    let response = TagsResponse { models };
     info!("Returning {} available model(s)", response.models.len());
     debug!("Available models: {:?}", response.models.iter().map(|m| &m.name).collect::<Vec<_>>());
     Json(response)
 }
 
-async fn show_handler(Json(req): Json<ShowRequest>) -> Result<Json<ShowResponse>, StatusCode> {
+async fn show_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ShowRequest>,
+) -> Result<Json<ShowResponse>, StatusCode> {
     info!("Received show request for model: '{}'", req.model);
     debug!("Processing model information request for: {}", req.model);
     
-    // For now, return information about our single model
-    // In a real implementation, you'd look up the specific model
-    if req.model == "gemma2:2b" || req.model.starts_with("gemma") {
-        info!("Model '{}' found, returning detailed information", req.model);
-        debug!("Generating modelfile and template information for: {}", req.model);
-        
-        let response = ShowResponse {
-            modelfile: "FROM gemma2:2b\nPARAMETER temperature 0.8\nPARAMETER top_p 0.9".to_string(),
-            parameters: "temperature 0.8\ntop_p 0.9\ntop_k 40\nrepeat_penalty 1.1".to_string(),
-            template: "{{ if .System }}System: {{ .System }}\n\n{{ end }}{{ if .Prompt }}User: {{ .Prompt }}\n\nAssistant: {{ end }}".to_string(),
-            details: ModelDetails {
-                parent_model: "".to_string(),
-                format: "gguf".to_string(),
-                family: "gemma".to_string(),
-                families: Some(vec!["gemma".to_string()]),
-                parameter_size: "2B".to_string(),
-                quantization_level: "Q4_K_M".to_string(),
-            },
-            model_info: ModelInfo {
-                name: req.model.clone(),
-                model: req.model.clone(),
-                modified_at: chrono::Utc::now().to_rfc3339(),
-                size: 1_073_741_824,
-                digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
+    // Try to resolve the model path to verify it exists
+    match resolve_model_path(&req.model, &state.model_path) {
+        Ok(path) => {
+            info!("Model '{}' found at {:?}, returning detailed information", req.model, path);
+            
+            // Get file size
+            let size = std::fs::metadata(&path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            
+            let response = ShowResponse {
+                modelfile: format!("FROM {}\nPARAMETER temperature 0.8\nPARAMETER top_p 0.9", req.model),
+                parameters: "temperature 0.8\ntop_p 0.9\ntop_k 40\nrepeat_penalty 1.1".to_string(),
+                template: "{{ if .System }}System: {{ .System }}\n\n{{ end }}{{ if .Prompt }}User: {{ .Prompt }}\n\nAssistant: {{ end }}".to_string(),
                 details: ModelDetails {
                     parent_model: "".to_string(),
-                    format: "gguf".to_string(),
-                    family: "gemma".to_string(),
-                    families: Some(vec!["gemma".to_string()]),
-                    parameter_size: "2B".to_string(),
-                    quantization_level: "Q4_K_M".to_string(),
+                    format: "rkllm".to_string(),
+                    family: "rkllm".to_string(),
+                    families: Some(vec!["rkllm".to_string()]),
+                    parameter_size: "unknown".to_string(),
+                    quantization_level: "unknown".to_string(),
                 },
-            },
-            capabilities: vec!["completion".to_string(), "chat".to_string()],
-        };
-        
-        debug!("Model info response prepared for '{}' - size: {} bytes", req.model, response.model_info.size);
-        Ok(Json(response))
-    } else {
-        warn!("Model '{}' not found in available models", req.model);
-        error!("Requested model '{}' not found", req.model);
-        Err(StatusCode::NOT_FOUND)
+                model_info: ModelInfo {
+                    name: req.model.clone(),
+                    model: req.model.clone(),
+                    modified_at: chrono::Utc::now().to_rfc3339(),
+                    size,
+                    digest: format!("sha256:{:064x}", req.model.as_bytes().iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))),
+                    details: ModelDetails {
+                        parent_model: "".to_string(),
+                        format: "rkllm".to_string(),
+                        family: "rkllm".to_string(),
+                        families: Some(vec!["rkllm".to_string()]),
+                        parameter_size: "unknown".to_string(),
+                        quantization_level: "unknown".to_string(),
+                    },
+                },
+                capabilities: vec!["completion".to_string(), "chat".to_string()],
+            };
+            
+            debug!("Model info response prepared for '{}' - size: {} bytes", req.model, response.model_info.size);
+            Ok(Json(response))
+        }
+        Err(e) => {
+            warn!("Model '{}' not found: {}", req.model, e);
+            error!("Requested model '{}' not found", req.model);
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 
-async fn running_models_handler() -> Json<RunningModelsResponse> {
+async fn running_models_handler(State(state): State<AppState>) -> Json<RunningModelsResponse> {
     info!("Received running models request");
-    // In a real implementation, track which models are actually loaded in memory
-    // For now, simulate that our model is running
-    let response = RunningModelsResponse {
-        models: vec![RunningModelInfo {
-            name: "gemma2:2b".to_string(),
-            model: "gemma2:2b".to_string(),
-            size: 1_073_741_824,
-            digest: "sha256:887827d6fc84bb81b9b4c64d3aae7e9c8b9e8a5f8c3d7a8b5e6f9c3d7a8b5e6f".to_string(),
+    // Since we load models per-request, there are no persistently running models
+    // But we can list available models as if they're ready to run
+    let available_models = list_available_models(&state.model_path);
+    
+    let models: Vec<RunningModelInfo> = available_models.iter().filter_map(|model_name| {
+        // Try to get file size if possible
+        let path = resolve_model_path(model_name, &state.model_path).ok()?;
+        let size = std::fs::metadata(&path).ok()?.len();
+        
+        Some(RunningModelInfo {
+            name: model_name.clone(),
+            model: model_name.clone(),
+            size,
+            digest: format!("sha256:{:064x}", model_name.as_bytes().iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64))),
             details: ModelDetails {
                 parent_model: "".to_string(),
-                format: "gguf".to_string(),
-                family: "gemma".to_string(),
-                families: Some(vec!["gemma".to_string()]),
-                parameter_size: "2B".to_string(),
-                quantization_level: "Q4_K_M".to_string(),
+                format: "rkllm".to_string(),
+                family: "rkllm".to_string(),
+                families: Some(vec!["rkllm".to_string()]),
+                parameter_size: "unknown".to_string(),
+                quantization_level: "unknown".to_string(),
             },
             expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
-            size_vram: 1_073_741_824,
-        }],
-    };
+            size_vram: size,
+        })
+    }).collect();
+    
+    let response = RunningModelsResponse { models };
     info!("Returning {} running model(s)", response.models.len());
     Json(response)
 }
 
-#[instrument(skip(state))]
 async fn openai_chat_handler(
     State(state): State<AppState>,
     Json(req): Json<OpenAIChatRequest>,
 ) -> Result<Json<OpenAIChatResponse>, StatusCode> {
     info!("=== OPENAI CHAT REQUEST START ===");
     info!("Received OpenAI chat request for model: '{}'", req.model);
-    info!("Chat details: {} messages, stream={:?}", req.messages.len(), req.stream);
-    debug!("OpenAI request: model='{}', temp={:?}, max_tokens={:?}, top_p={:?}", 
-           req.model, req.temperature, req.max_tokens, req.top_p);
+    //info!("Chat details: {} messages, stream={:?}", req.messages.len(), req.stream);
+    //debug!("OpenAI request: model='{}', temp={:?}, max_tokens={:?}, top_p={:?}", 
+    //       req.model, req.temperature, req.max_tokens, req.top_p);
     
     // Log message summary
     for (i, message) in req.messages.iter().enumerate() {
@@ -809,6 +1002,10 @@ async fn openai_chat_handler(
         Ok(Json(chat_response)) => {
             info!("OpenAI chat request completed successfully!");
             
+            // Clean the response content to remove <think> tags
+            let cleaned_content = clean_response_content(&chat_response.message.content);
+            debug!("Cleaned response: removed thinking tags, final length: {} chars", cleaned_content.len());
+            
             // Convert response to OpenAI format
             let openai_response = OpenAIChatResponse {
                 id: format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -822,7 +1019,7 @@ async fn openai_chat_handler(
                     index: 0,
                     message: OpenAIMessage {
                         role: chat_response.message.role,
-                        content: chat_response.message.content,
+                        content: cleaned_content,
                     },
                     finish_reason: "stop".to_string(),
                 }],
@@ -833,6 +1030,23 @@ async fn openai_chat_handler(
                 },
             };
 
+            // Log the complete response being sent to VS Code
+            debug!("Response being sent to VS Code:");
+            debug!("  ID: {}", openai_response.id);
+            debug!("  Object: {}", openai_response.object);
+            debug!("  Created: {}", openai_response.created);
+            debug!("  Model: {}", openai_response.model);
+            debug!("  Choices count: {}", openai_response.choices.len());
+            if !openai_response.choices.is_empty() {
+                debug!("  Choice[0].index: {}", openai_response.choices[0].index);
+                debug!("  Choice[0].message.role: {}", openai_response.choices[0].message.role);
+                debug!("  Choice[0].message.content: '{}'", openai_response.choices[0].message.content);
+                debug!("  Choice[0].finish_reason: {}", openai_response.choices[0].finish_reason);
+            }
+            debug!("  Usage.prompt_tokens: {}", openai_response.usage.prompt_tokens);
+            debug!("  Usage.completion_tokens: {}", openai_response.usage.completion_tokens);
+            debug!("  Usage.total_tokens: {}", openai_response.usage.total_tokens);
+            
             info!("=== OPENAI CHAT REQUEST END ===");
             Ok(Json(openai_response))
         }
@@ -941,7 +1155,6 @@ async fn main() {
         .route("/api/show", post(show_handler))
         .route("/api/ps", get(running_models_handler))
         .route("/v1/chat/completions", post(openai_chat_handler))
-        .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .fallback(not_found_handler)
         .with_state(state);

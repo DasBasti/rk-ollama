@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rkllm-rs = { path="../rkllm-rs" }
+rkllm-rs = { path="lib/rkllm-rs" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
@@ -15,3 +15,5 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenv = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.0", features = ["v4"] }
+regex = "1.11.2"

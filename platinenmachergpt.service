@@ -1,0 +1,34 @@
+[Unit]
+Description=Platinenmachergpt - RKLLM-based LLM Server with Ollama-compatible API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/platinenmachergpt
+
+# Environment variables
+Environment="MODEL_PATH=models"
+Environment="MAX_CONTEXT_LEN=1024"
+Environment="MAX_NEW_TOKENS_DEFAULT=512"
+Environment="MAX_NEW_TOKENS_LIMIT=512"
+Environment="MAX_PROMPT_LENGTH=4096"
+Environment="RUST_LOG=info"
+
+# Start the server
+ExecStart=/opt/platinenmachergpt/platinenmachergpt
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=platinenmachergpt
+
+# Resource limits (optional, adjust as needed)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

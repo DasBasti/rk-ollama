@@ -103,8 +103,7 @@ fi
 echo "✅ Server is reachable"
 echo
 
-# Benchmark lightweight endpoints
-benchmark_endpoint "Version Endpoint" "GET" "/api/version" ""
+# Benchmark lightweight endpoints1"
 
 benchmark_endpoint "List Models" "GET" "/api/tags" ""
 

@@ -13,6 +13,49 @@ A Rust-based HTTP server that provides an Ollama-compatible API for RKLLM (Rockc
 - 🛡️ **Error Handling**: Robust error handling with proper HTTP status codes
 - 🔒 **CORS Support**: Cross-origin resource sharing enabled for web applications
 - 📝 **JSON API**: Clean JSON request/response format
+- 📂 **Dynamic Model Loading**: Automatically load different models based on the `model` field in requests
+
+## Dynamic Model Loading
+
+The server supports loading different `.rkllm` models dynamically based on the `model` name specified in API requests. This allows you to have multiple models available and switch between them without restarting the server.
+
+### How It Works
+
+1. When a request comes in with a `model` field (e.g., `"model": "llama3"`), the server searches for a corresponding `.rkllm` file.
+2. The search order is:
+   - If `MODEL_PATH` is a directory: look for `<model_name>.rkllm` inside that directory
+   - If `MODEL_PATH` is a directory: also check subdirectories named after the model
+   - If `MODEL_PATH` is a file: look in its parent directory
+   - Current working directory as a fallback
+   - `models/` subdirectory in the current working directory
+
+### Example
+
+```bash
+# Set MODEL_PATH to a directory containing your models
+export MODEL_PATH=/home/user/models
+
+# Directory structure:
+# /home/user/models/
+# ├── llama3.rkllm
+# ├── deepseek-r1.rkllm
+# └── gemma3.rkllm
+
+# Now you can request different models:
+curl -X POST http://localhost:11434/api/generate \
+  -d '{"model": "llama3", "prompt": "Hello"}'
+
+curl -X POST http://localhost:11434/api/generate \
+  -d '{"model": "deepseek-r1", "prompt": "Hello"}'
+```
+
+### Listing Available Models
+
+Use the `/api/tags` endpoint to list all available `.rkllm` models:
+
+```bash
+curl http://localhost:11434/api/tags
+```
 
 ## Prerequisites
 
